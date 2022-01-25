@@ -10,6 +10,6 @@ RUN touch ~/.bashrc && chmod +x ~/.bashrc
 
 RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.34.0/install.sh | bash
 
-RUN source ~/.bashrc && nvm install 10.16.0
+RUN source ~/.bashrc && nvm install 16.13.2
 
 WORKDIR /build

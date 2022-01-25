@@ -1,154 +1,165 @@
 'use strict';
 
-const querystring = require('querystring');
-const aws = require('aws-sdk');
-const s3 = new aws.S3({
-  region: 'YOUR_REGION',
-  signatureVersion: 'v4'
-});
-const sharp = require('sharp');
-
-// Image types that can be handled by Sharp
-const supportImageTypes = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'tiff'];
-
 exports.handler = async (event, context, callback) => {
-  const { config, request, response } = event.Records[0].cf;
+  // config
+  const BUCKET = 'viecasa-wordpress-images';
+  const DEFAULT_MAX_WIDTH = 3840;
+  const DEFAULT_MAX_HEIGHT = 2160;
+  const MAX_AGE = "max-age=15552000";
 
-  // select origin bucket
-  const bucket = 'YOUR_BUCKET';
+  const response = event.Records[0].cf.response;
 
-  // check if image is present and not cached.
-  if (response.status == 200) {
-    // parse the querystring key-value pairs.
-    const params = querystring.parse(request.querystring);
-    // If none of the s, t, or q variables is present, just pass the request
-    if (!params.s || !params.t || !params.q) {
-      callback(null, response);
-      return;
-    }
+  console.log("Response status code :%s", response.status);
 
-    // read the S3 key from the path variable.
-    // assets/images/sample.jpeg
-    let key = decodeURIComponent(request.uri).substring(1);
+  // pass through other responses except 403 and 404
+  if (response.status != 403 && response.status != 404) {
+    callback(null, response);
+    return;
+  }
 
-    // parse the width, height, type, quality, format, image name
-    let width, height, type, quality, requiredFormat;
 
-    // s=100x100&t=enlargement&q=100(&f=webp)
-    const sizeMatch = params.s.split('x');
-    const typeMatch = params.t;
-    const qualityMatch = params.q;
-    const formatMatch = params.f;
+  // image is not present, do resize and save to S3
+  // Image types that can be handled by Sharp
+  const supportImageTypes = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'tiff'];
 
-    let originalFormat = key.match(/(.*)\.(.*)/)[2].toLowerCase();
+  // read the S3 key from the path variable.
+  // assets/images/sample.jpeg
+  const request = event.Records[0].cf.request;
+  const path = request.uri.substring(1);
 
-    if (
-      !supportImageTypes.some(type => {
-        return type == originalFormat;
-      })
-    ) {
-      responseUpdate(403, "Forbidden", "Unsupported image type", [
+  // parse the width, height, crop, image name
+  const keyMatch = path.match(/-(\d+)x(\d+)(c?)/);
+
+  // skip unsupported URI type
+  if (keyMatch == null) {
+    responseUpdate(403, "Forbidden", "Unsupported URI", [
+      { key: "Content-Type", value: "text/plain" }
+    ]);
+    callback(null, response);
+    return;
+  }
+
+  // retrieve width, height, crop from URI
+  let width = parseInt(keyMatch[1]);
+  if (width <= 0) {
+    width = DEFAULT_MAX_WIDTH;
+  }
+
+  let height = parseInt(keyMatch[2]);
+  if (height <= 0) {
+    DEFAULT_MAX_HEIGHT;
+  }
+
+  const crop = keyMatch[3] === "c";
+
+  const pathNoExt = path.substring(0, path.lastIndexOf("-"));
+  const ext = path.substring(path.lastIndexOf("."));
+  const key = pathNoExt + ext;
+
+  let imageFormat = ext.substring(1);
+  if (imageFormat == "jpg") {
+    imageFormat = "jpeg";
+  }
+
+  // skip unsupported image type
+  if (
+    !supportImageTypes.some(type => {
+      return type == imageFormat;
+    })
+  ) {
+    responseUpdate(403, "Forbidden", "Unsupported image type", [
+      { key: "Content-Type", value: "text/plain" }
+    ]);
+    callback(null, response);
+    return;
+  }
+
+
+  // import deps
+  const AWS = require('aws-sdk');
+  const S3 = new AWS.S3({
+    signatureVersion: 'v4',
+  });
+  const Sharp = require('sharp');
+
+  try {
+    // get the source image file
+    const s3Object = await S3.getObject({ Bucket: BUCKET, Key: key }).promise();
+
+    if (s3Object.ContentLength == 0) {
+      responseUpdate(404, "Not Found", "The image does not exist.", [
         { key: "Content-Type", value: "text/plain" }
       ]);
       callback(null, response);
       return;
     }
 
-    width = parseInt(sizeMatch[0], 10);
-    height = parseInt(sizeMatch[1], 10);
-    type = typeMatch == "crop" ? "cover" : typeMatch;
-    quality = parseInt(qualityMatch, 10);
+    // resize
+    let metaData,
+      resizedImage,
+      byteLength = 0;
 
-    // correction for jpg required for 'Sharp'
-    originalFormat = originalFormat == "jpg" ? "jpeg" : originalFormat;
-    requiredFormat =
-      formatMatch == "webp"
-        ? "webp"
-        : originalFormat == "jpg"
-          ? "jpeg"
-          : originalFormat;
+    resizedImage = await Sharp(s3Object.Body).rotate();
+    metaData = await resizedImage.metadata();
 
-    try {
-      // get the source image file
-      const s3Object = await s3
-        .getObject({
-          Bucket: bucket,
-          Key: key
-        })
-        .promise();
-      if (s3Object.ContentLength == 0) {
-        responseUpdate(404, "Not Found", "The image does not exist.", [
-          { key: "Content-Type", value: "text/plain" }
-        ]);
-        callback(null, response);
-        return;
+    if (metaData.width > width || metaData.height > height) {
+      if (crop) {
+        resizedImage.resize(width, height, { fit: "outside" });
+        resizedImage.resize(width, height, { fit: "cover" });
+      } else {
+        resizedImage.resize(width, height, { fit: "inside" });
       }
+    }
 
-      let metaData,
-        resizedImage,
-        byteLength = 0;
+    let resizedImageBuffer = await resizedImage.toBuffer();
 
-      if (requiredFormat != "jpeg" && requiredFormat != "webp") {
-        console.log(`Info: image format is ${requiredFormat}, trying to jpeg.`);
-        requiredFormat = "jpeg";
-      }
-      while (1) {
-        resizedImage = await sharp(s3Object.Body).rotate();
-        metaData = await resizedImage.metadata();
-
-        if (metaData.width > width || metaData.height > height) {
-          resizedImage.resize(width, height, { fit: type });
-        }
-        if (byteLength >= 1046528 || originalFormat != requiredFormat) {
-          resizedImage.toFormat(requiredFormat, { quality: quality });
-        }
-        resizedImage = await resizedImage.toBuffer();
-
-        byteLength = Buffer.byteLength(resizedImage, "base64");
-        if (byteLength == metaData.size) {
-          callback(null, response);
-          return;
-        }
-        if (byteLength >= 1046528) {
-          quality -= 10;
-          console.log(
-            `Info: Content-Length is ${byteLength}, ` +
-            `trying again with quality ${quality}. // ` +
-            bucket +
-            " ## " +
-            key
-          );
-        } else {
-          break;
-        }
-      }
-
-      responseUpdate(
-        200,
-        "OK",
-        resizedImage.toString("base64"),
-        [{ key: "Content-Type", value: "image/" + requiredFormat }],
-        "base64"
-      );
-      response.headers["cache-control"] = [
-        { key: "cache-control", value: "max-age=31536000" }
-      ];
-      return callback(null, response);
-    } catch (err) {
-      console.log(
-        `for debugging. key, params === ${key} === q=${params.q}&s=${
-        params.s
-        }&t=${params.t}`
-      );
-      console.error(err);
+    byteLength = Buffer.byteLength(resizedImageBuffer, "base64");
+    if (byteLength == metaData.size) {
       callback(null, response);
       return;
     }
-  } else {
-    // allow the response to pass through
+
+    // save the resized object to S3 bucket with appropriate object key.
+    await S3.putObject({
+      Body: resizedImageBuffer,
+      Bucket: BUCKET,
+      ContentType: 'image/' + imageFormat,
+      CacheControl: MAX_AGE,
+      Key: path,
+      StorageClass: 'STANDARD'
+    }).promise();
+    console.log("Saved resized image: ", path);
+
+    // return image
+    let body = resizedImageBuffer.toString("base64");
+
+    // lambda@edge response json 1MB limit
+    while (body.length >= 1000 * 1000) {
+      const ratio = Math.sqrt(body.length / 1000 / 1000) * 1.2;
+      width = Math.floor(width / ratio);
+      height = Math.floor(height / ratio);
+      console.log("Response bigger than 1MB, resize with lower resolution " + width + "x" + height);
+      resizedImage.resize(width, height, { fit: crop ? "cover" : "inside" });
+      resizedImageBuffer = await resizedImage.toBuffer();
+      body = resizedImageBuffer.toString("base64");
+    }
+
+    responseUpdate(
+      200,
+      "OK",
+      body,
+      [{ key: "Content-Type", value: "image/" + imageFormat }],
+      "base64"
+    );
+
+    return callback(null, response);
+  } catch (err) {
+    console.log("Exception!");
+    console.log(err);
+    console.log("path = ", path);
+    console.log("key = ", key);
     callback(null, response);
-    return;
-  }
+  };
 
   function responseUpdate(
     status,
